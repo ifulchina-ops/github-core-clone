@@ -412,18 +412,53 @@ export function readPack(
 }
 
 /**
+ * Adler-32, the checksum a zlib stream ends with (big-endian, the last 4 bytes of the
+ * stream). Node exposes no adler32, so this is the textbook loop over the bytes.
+ */
+export function adler32(data: Uint8Array): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]!) % MOD;
+    b = (b + a) % MOD;
+  }
+  return (b << 16) | a;
+}
+
+/**
  * Inflate one pack entry's deflate stream starting at `start`, ending before `limit`,
  * expecting `size` output bytes. Returns the bytes and the offset just past the stream.
- * Binary search works because inflateSync throws on a truncated stream and ignores
- * trailing bytes once the stream ends.
+ *
+ * The stream's end is found through its own trailer, not a binary search: inflate the
+ * full remaining slice once (inflateSync ignores bytes past the stream's end), take the
+ * adler32 of the inflated bytes, and scan for those 4 bytes — the first occurrence that
+ * re-inflates to exactly `size` bytes is the stream's end. A zlib stream is 2 header
+ * bytes, the deflate data, then the adler32, so the true end is always an occurrence,
+ * and any earlier spurious occurrence fails the re-inflate and is skipped. Two inflates
+ * and no thrown errors in the common case, where the binary search needed ~log2(n)
+ * inflates and threw on every probe below the end. Falls back to the binary search when
+ * no occurrence verifies, so an unusual stream still reads.
  */
 function inflateAt(buffer: Buffer, start: number, limit: number, size: number): { bytes: Buffer; next: number } {
+  const full = inflateSync(buffer.subarray(start, limit), { maxOutputLength: Math.max(size, 1) });
+  if (full.length !== size) throw new Error(`pack entry inflates to ${full.length} bytes, expected ${size}`);
+  const trailer = Buffer.allocUnsafe(4);
+  trailer.writeUInt32BE(adler32(full) >>> 0, 0);
+  let at = buffer.indexOf(trailer, start + 2);
+  while (at >= 0 && at + 4 <= limit) {
+    try {
+      const out = inflateSync(buffer.subarray(start, at + 4), { maxOutputLength: Math.max(size, 1) });
+      if (out.length === size) return { bytes: full, next: at + 4 };
+    } catch {
+      // A spurious adler32 inside the stream: truncated, so keep scanning.
+    }
+    at = buffer.indexOf(trailer, at + 1);
+  }
+  // No occurrence verified (should not happen for a well-formed zlib stream): fall back
+  // to the binary search over the stream's end.
   let lo = start;
   let hi = limit;
-  // Invariant: inflate(start..lo) fails or is short; inflate(start..hi) succeeds with `size` bytes.
-  // First confirm the full slice works, so hi is valid.
-  const full = inflateSync(buffer.subarray(start, hi), { maxOutputLength: Math.max(size, 1) });
-  if (full.length !== size) throw new Error(`pack entry inflates to ${full.length} bytes, expected ${size}`);
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     let ok = false;
@@ -436,5 +471,5 @@ function inflateAt(buffer: Buffer, start: number, limit: number, size: number): 
     if (ok) hi = mid;
     else lo = mid + 1;
   }
-  return { bytes: inflateSync(buffer.subarray(start, lo), { maxOutputLength: Math.max(size, 1) }), next: lo };
+  return { bytes: full, next: lo };
 }

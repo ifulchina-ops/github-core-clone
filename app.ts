@@ -37,15 +37,14 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** The bearer token this process trusts (the trial token, from the environment). */
-function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
-}
-
 export function createApp(): ForgeApp {
   const store = new Store();
+  // The bearer token this process trusts (the trial token, from the environment).
+  // Read once: the environment never changes under a running trial, and reading
+  // process.env on every request is needless work on the hot path.
+  const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const server = createServer((req, res) => {
-    void handleRequest(req, res, store).catch((err: unknown) => {
+    void handleRequest(req, res, store, expectedToken).catch((err: unknown) => {
       const detail = err instanceof Error ? err.message : String(err);
       if (!res.headersSent) {
         res.writeHead(500, { 'content-type': 'application/json', 'x-github-request-id': `req-${++requestCounter}` });
@@ -60,12 +59,14 @@ export function createApp(): ForgeApp {
     store,
     close: () =>
       new Promise<void>((resolve) => {
+        // Drop idle keep-alive sockets first: server.close() alone waits for them.
+        server.closeIdleConnections();
         server.close(() => resolve());
       }),
   };
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, store: Store): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, store: Store, expectedToken: string): Promise<void> {
   const requestId = `req-${++requestCounter}`;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const method = (req.method ?? 'GET').toUpperCase();
@@ -82,6 +83,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
     res.end(text);
   };
 
+  /** Answer with a body that is already serialized bytes (no stringify, no re-encode). */
+  const jsonBuffer = (status: number, body: Buffer, headers: Record<string, string> = {}): void => {
+    res.writeHead(status, {
+      'content-type': 'application/json',
+      'x-github-request-id': requestId,
+      'content-length': body.length,
+      ...headers,
+    });
+    res.end(body);
+  };
+
   // The health probe needs no credentials and answers before anything else.
   if (pathname === '/healthz') {
     json(200, { ok: true });
@@ -96,8 +108,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
     /\.git\//.test(pathname);
   if (needsAuth) {
     const header = req.headers.authorization ?? '';
-    const token = expectedToken();
-    if (token === '' || header !== `Bearer ${token}`) {
+    if (expectedToken === '' || header !== `Bearer ${expectedToken}`) {
       json(401, { message: 'Unauthorized' });
       return;
     }
@@ -168,7 +179,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
       }
       parsedBody = parsed.value;
     }
-    const ctx: RestCtx = { req, res, store, method, segments, query: url.searchParams, body: parsedBody, requestId, json };
+    const ctx: RestCtx = { req, res, store, method, segments, query: url.searchParams, body: parsedBody, requestId, json, jsonBuffer };
     if (!handleRest(ctx)) json(404, { message: 'Not Found' });
     return;
   }

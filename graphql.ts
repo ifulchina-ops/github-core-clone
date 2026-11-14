@@ -486,6 +486,7 @@ function parseQuery(text: string): GqlDocument {
           return null;
         }
         found.issue.state = 'closed';
+        this.store.invalidateIssue(found.issue);
         return this.select({ __type: 'CloseIssuePayload', issue: found.issue, repo: found.repo }, field);
       }
       if (field.name === 'createPullRequest') {

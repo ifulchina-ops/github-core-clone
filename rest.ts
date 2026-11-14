@@ -20,6 +20,8 @@ export interface RestCtx {
   readonly requestId: string;
   /** Answer with a JSON body (status + extra headers). */
   readonly json: (status: number, body: unknown, headers?: Record<string, string>) => void;
+  /** Answer with a body that is already serialized bytes (status + extra headers). */
+  readonly jsonBuffer: (status: number, body: Buffer, headers?: Record<string, string>) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -206,6 +208,7 @@ export function handleRest(ctx: RestCtx): boolean {
       return true;
     }
     repo.refs.set(ref, sha);
+    ctx.store.touch(repo);
     ctx.json(201, { ref, object: { sha }, url: `/api/v3/repos/${owner}/${repoName}/git/refs/${ref}` });
     return true;
   }
@@ -460,7 +463,7 @@ function parseIdentity(line: string): { name: string; email: string; date: strin
         ctx.json(err.status, err.body);
         return true;
       }
-      ctx.json(201, ctx.store.issueJson(repo, result));
+      ctx.jsonBuffer(201, ctx.store.issueJsonBytes(repo, result));
       return true;
     }
 
@@ -487,7 +490,7 @@ function parseIdentity(line: string): { name: string; email: string; date: strin
 
     // GET /repos/{owner}/{repo}/issues/{n}
     if (method === 'GET' && segments.length === 1) {
-      ctx.json(200, ctx.store.issueJson(repo, issue));
+      ctx.jsonBuffer(200, ctx.store.issueJsonBytes(repo, issue));
       return true;
     }
 
@@ -496,7 +499,8 @@ function parseIdentity(line: string): { name: string; email: string; date: strin
       if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
-      ctx.json(200, ctx.store.issueJson(repo, issue));
+      ctx.store.invalidateIssue(issue);
+      ctx.jsonBuffer(200, ctx.store.issueJsonBytes(repo, issue));
       return true;
     }
 

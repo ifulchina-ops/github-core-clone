@@ -204,6 +204,30 @@ function reachableObjects(store: Store, repo: Repo, tip: string): Map<string, Gi
   return out;
 }
 
+/** One commit and its own tree and blobs — no parents. A shallow fetch sends only
+ * the commits inside the depth limit, each with its own tree; the parents of a
+ * boundary commit are never part of its own objects. */
+function commitOwnObjects(store: Store, repo: Repo, oid: string): Map<string, GitObject> {
+  const out = new Map<string, GitObject>();
+  const commit = store.getObject(repo, oid);
+  if (commit === undefined || commit.type !== 'commit') return out;
+  out.set(oid, commit);
+  const visitTree = (treeOid: string): void => {
+    const tree = store.getObject(repo, treeOid);
+    if (tree === undefined || tree.type !== 'tree' || out.has(treeOid)) return;
+    out.set(treeOid, tree);
+    for (const entry of parseTree(tree.data)) {
+      if (entry.mode === '40000') visitTree(entry.oid);
+      else {
+        const blob = store.getObject(repo, entry.oid);
+        if (blob !== undefined) out.set(entry.oid, blob);
+      }
+    }
+  };
+  visitTree(parseCommit(commit.data).tree);
+  return out;
+}
+
 /**
  * Work out what a fetch sends: the objects reachable from the wants that the client
  * does not already hold, the shallow boundary commits, and the acknowledgments.
@@ -303,7 +327,7 @@ function planFetch(
   }
   for (const [oid] of included) {
     if (held.has(oid)) continue;
-    for (const [reachableOid, object] of reachableObjects(store, repo, oid)) {
+    for (const [reachableOid, object] of commitOwnObjects(store, repo, oid)) {
       if (!held.has(reachableOid)) send.set(reachableOid, object);
     }
   }

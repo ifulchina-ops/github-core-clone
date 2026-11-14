@@ -94,7 +94,11 @@ function tokenize(text: string): Array<{ kind: string; value: string }> {
 
 class Parser {
   private pos = 0;
-  constructor(private readonly tokens: Array<{ kind: string; value: string }>) {}
+  private readonly tokens: Array<{ kind: string; value: string }>;
+
+  constructor(tokens: Array<{ kind: string; value: string }>) {
+    this.tokens = tokens;
+  }
 
   peek(): { kind: string; value: string } | undefined {
     return this.tokens[this.pos];
@@ -313,8 +317,13 @@ function parseQuery(text: string): GqlDocument {
 
   class Executor {
     private readonly errors: Array<{ message: string }> = [];
+    private readonly store: Store;
+    private readonly variables: Record<string, unknown>;
 
-    constructor(private readonly store: Store, private readonly variables: Record<string, unknown>) {}
+    constructor(store: Store, variables: Record<string, unknown>) {
+      this.store = store;
+      this.variables = variables;
+    }
 
     run(document: GqlDocument): { data: Record<string, JsonValue | null>; errors: Array<{ message: string }> } {
       const data: Record<string, JsonValue | null> = {};
@@ -397,7 +406,14 @@ function parseQuery(text: string): GqlDocument {
       const out: Record<string, unknown> = {};
       for (const sub of field.selection) {
         const resolved = this.resolve(value, sub);
-        if (resolved !== undefined) out[sub.alias ?? sub.name] = resolved;
+        if (resolved === undefined) continue;
+        // An inline fragment's fields merge into the parent object; they are
+        // not nested under the fragment itself.
+        if (sub.name === '__fragment' && resolved !== null && typeof resolved === 'object' && !Array.isArray(resolved)) {
+          Object.assign(out, resolved);
+          continue;
+        }
+        out[sub.alias ?? sub.name] = resolved;
       }
       return out;
     }

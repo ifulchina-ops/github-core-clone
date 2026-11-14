@@ -211,6 +211,10 @@ function packObjectHeader(type: GitObjectType, size: number): Buffer {
     bytes.push(rest & 0x7f);
     rest >>= 7;
   }
+  // The continuation bit belongs on every byte except the last: set it on each
+  // byte that another one follows (a 2-byte header needs it on the first byte
+  // only; a 3-byte header on the first two).
+  for (let i = 0; i + 1 < bytes.length; i += 1) bytes[i] |= 0x80;
   return Buffer.from(bytes);
 }
 

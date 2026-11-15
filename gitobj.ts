@@ -412,46 +412,54 @@ export function readPack(
 }
 
 /**
- * Adler-32, the checksum a zlib stream ends with (big-endian, the last 4 bytes of the
- * stream). Node exposes no adler32, so this is the textbook loop over the bytes.
+ * Adler-32, the checksum a zlib stream carries as its last 4 bytes (big-endian). Node
+ * exposes no adler32, so this is the standard loop — with the modulus deferred: a and b
+ * stay below 2^32 for up to 5552 bytes at a time (the largest block where b cannot
+ * overflow), so the expensive `% 65521` runs once per block instead of once per byte.
  */
 export function adler32(data: Uint8Array): number {
   const MOD = 65521;
+  const BLOCK = 5552;
   let a = 1;
   let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + data[i]!) % MOD;
-    b = (b + a) % MOD;
+  for (let off = 0; off < data.length; off += BLOCK) {
+    const end = Math.min(off + BLOCK, data.length);
+    for (let i = off; i < end; i += 1) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
   }
-  return (b << 16) | a;
+  return ((b << 16) | a) >>> 0;
 }
 
 /**
  * Inflate one pack entry's deflate stream starting at `start`, ending before `limit`,
  * expecting `size` output bytes. Returns the bytes and the offset just past the stream.
  *
- * The stream's end is found through its own trailer, not a binary search: inflate the
- * full remaining slice once (inflateSync ignores bytes past the stream's end), take the
- * adler32 of the inflated bytes, and scan for those 4 bytes — the first occurrence that
- * re-inflates to exactly `size` bytes is the stream's end. A zlib stream is 2 header
- * bytes, the deflate data, then the adler32, so the true end is always an occurrence,
- * and any earlier spurious occurrence fails the re-inflate and is skipped. Two inflates
- * and no thrown errors in the common case, where the binary search needed ~log2(n)
- * inflates and threw on every probe below the end. Falls back to the binary search when
- * no occurrence verifies, so an unusual stream still reads.
+ * The stream's end is read off its own trailer, not found by binary search: inflate the
+ * whole remaining slice once (inflateSync ignores bytes past the stream's end), take the
+ * adler32 of the inflated bytes, and look for those 4 bytes in the packed data — a zlib
+ * stream is 2 header bytes, the deflate data, then the adler32, so the true end is
+ * always one of the occurrences, and an earlier spurious occurrence fails the
+ * re-inflate and is skipped. Two inflates and no thrown errors in the common case,
+ * where the binary search needed ~log2(n) inflates and threw on every probe below the
+ * end. Falls back to the binary search when no occurrence verifies, so an unusual
+ * stream still reads.
  */
 function inflateAt(buffer: Buffer, start: number, limit: number, size: number): { bytes: Buffer; next: number } {
   const full = inflateSync(buffer.subarray(start, limit), { maxOutputLength: Math.max(size, 1) });
   if (full.length !== size) throw new Error(`pack entry inflates to ${full.length} bytes, expected ${size}`);
   const trailer = Buffer.allocUnsafe(4);
-  trailer.writeUInt32BE(adler32(full) >>> 0, 0);
+  trailer.writeUInt32BE(adler32(full), 0);
   let at = buffer.indexOf(trailer, start + 2);
-  while (at >= 0 && at + 4 <= limit) {
+  while (at !== -1 && at + 4 <= limit) {
     try {
       const out = inflateSync(buffer.subarray(start, at + 4), { maxOutputLength: Math.max(size, 1) });
       if (out.length === size) return { bytes: full, next: at + 4 };
     } catch {
-      // A spurious adler32 inside the stream: truncated, so keep scanning.
+      // A spurious adler32 inside the deflate data: the slice is truncated, keep scanning.
     }
     at = buffer.indexOf(trailer, at + 1);
   }

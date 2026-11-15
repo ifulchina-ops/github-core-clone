@@ -40,11 +40,11 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 export function createApp(): ForgeApp {
   const store = new Store();
   // The bearer token this process trusts (the trial token, from the environment).
-  // Read once: the environment never changes under a running trial, and reading
+  // Read once: the environment never changes under a running trial, and looking up
   // process.env on every request is needless work on the hot path.
-  const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const authToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   const server = createServer((req, res) => {
-    void handleRequest(req, res, store, expectedToken).catch((err: unknown) => {
+    void handleRequest(req, res, store, authToken).catch((err: unknown) => {
       const detail = err instanceof Error ? err.message : String(err);
       if (!res.headersSent) {
         res.writeHead(500, { 'content-type': 'application/json', 'x-github-request-id': `req-${++requestCounter}` });
@@ -66,7 +66,7 @@ export function createApp(): ForgeApp {
   };
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, store: Store, expectedToken: string): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, store: Store, authToken: string): Promise<void> {
   const requestId = `req-${++requestCounter}`;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const method = (req.method ?? 'GET').toUpperCase();
@@ -84,7 +84,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
   };
 
   /** Answer with a body that is already serialized bytes (no stringify, no re-encode). */
-  const jsonBuffer = (status: number, body: Buffer, headers: Record<string, string> = {}): void => {
+  const jsonBytes = (status: number, body: Buffer, headers: Record<string, string> = {}): void => {
     res.writeHead(status, {
       'content-type': 'application/json',
       'x-github-request-id': requestId,
@@ -108,7 +108,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
     /\.git\//.test(pathname);
   if (needsAuth) {
     const header = req.headers.authorization ?? '';
-    if (expectedToken === '' || header !== `Bearer ${expectedToken}`) {
+    if (authToken === '' || header !== `Bearer ${authToken}`) {
       json(401, { message: 'Unauthorized' });
       return;
     }
@@ -179,7 +179,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
       }
       parsedBody = parsed.value;
     }
-    const ctx: RestCtx = { req, res, store, method, segments, query: url.searchParams, body: parsedBody, requestId, json, jsonBuffer };
+    const ctx: RestCtx = { req, res, store, method, segments, query: url.searchParams, body: parsedBody, requestId, json, jsonBytes };
     if (!handleRest(ctx)) json(404, { message: 'Not Found' });
     return;
   }

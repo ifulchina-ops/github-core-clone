@@ -73,14 +73,14 @@ async function main(): Promise<void> {
   // If the harness stops the entry with a signal, close the server and exit 0
   // instead of dying mid-request: the trial is over by then, and a clean exit
   // keeps the run's teardown unambiguous.
-  let stopping = false;
-  const stop = (): void => {
-    if (stopping) return;
-    stopping = true;
+  let shuttingDown = false;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     void app.close().then(() => process.exit(0));
   };
-  process.once('SIGTERM', stop);
-  process.once('SIGINT', stop);
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   await new Promise<void>((resolve, reject) => {
     app.server.once('error', reject);
     app.server.listen(0, () => resolve());

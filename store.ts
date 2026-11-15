@@ -60,8 +60,8 @@ export interface Issue {
   labels: string[];
   readonly createdSeq: number;
   readonly comments: Comment[];
-  /** The last serialized issueJson, cleared by every mutation (see invalidateIssue). */
-  cachedBody: Buffer | null;
+  /** Serialized REST body, built lazily and dropped by dropIssueBody on any mutation. */
+  bodyBytes: Buffer | null;
 }
 
 export interface Pull {
@@ -101,13 +101,13 @@ export interface Repo {
   issueSeq: number;
   pullSeq: number;
   commentSeq: number;
-  /** Bumped by touch() on every git-state mutation (object or ref write). */
-  version: number;
-  /** Cached git-wire answers (fetch packs, ls-refs, advertisements), cleared by touch(). */
-  readonly gitCache: Map<string, Buffer>;
-  /** Parsed commits/trees, keyed by oid. Objects are immutable, so a parse never goes stale. */
-  readonly commitCache: Map<string, CommitView>;
-  readonly treeCache: Map<string, TreeEntry[]>;
+  /** Bumped by bump() on every git-state change (a new object or a ref write). */
+  generation: number;
+  /** Built git-wire answers (fetch packs, ls-refs, advertisements), dropped by bump(). */
+  readonly wireCache: Map<string, Buffer>;
+  /** Parsed commits and trees, keyed by oid. Objects are immutable, so a parse never goes stale. */
+  readonly parsedCommits: Map<string, CommitView>;
+  readonly parsedTrees: Map<string, TreeEntry[]>;
 }
 
 export interface FileEntry {
@@ -156,44 +156,44 @@ export class Store {
       issueSeq: 0,
       pullSeq: 0,
       commentSeq: 0,
-      version: 0,
-      gitCache: new Map(),
-      commitCache: new Map(),
-      treeCache: new Map(),
+      generation: 0,
+      wireCache: new Map(),
+      parsedCommits: new Map(),
+      parsedTrees: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
     return repo;
   }
 
   /**
-   * Mark a repository's git state changed: bump its version and drop every cached
-   * git-wire answer (fetch packs, ls-refs, advertisements). Every object or ref
-   * write calls this, so a cached answer can never outlive the state it came from.
+   * Record that a repo's git state changed: advance its generation and throw away every
+   * cached wire answer (fetch packs, ls-refs, advertisements). Every object or ref write
+   * calls this, so a cached answer can never outlive the state it was built from.
    */
-  touch(repo: Repo): void {
-    repo.version += 1;
-    repo.gitCache.clear();
+  bump(repo: Repo): void {
+    repo.generation += 1;
+    repo.wireCache.clear();
   }
 
   /** A commit's parsed headers, memoized per repo (commits are immutable). */
-  commitView(repo: Repo, oid: string): CommitView | undefined {
-    const cached = repo.commitCache.get(oid);
-    if (cached !== undefined) return cached;
+  commitOf(repo: Repo, oid: string): CommitView | undefined {
+    const hit = repo.parsedCommits.get(oid);
+    if (hit !== undefined) return hit;
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'commit') return undefined;
     const view = parseCommit(object.data);
-    repo.commitCache.set(oid, view);
+    repo.parsedCommits.set(oid, view);
     return view;
   }
 
   /** A tree's parsed entries, memoized per repo (trees are immutable). */
-  treeEntries(repo: Repo, oid: string): TreeEntry[] | undefined {
-    const cached = repo.treeCache.get(oid);
-    if (cached !== undefined) return cached;
+  entriesOf(repo: Repo, oid: string): TreeEntry[] | undefined {
+    const hit = repo.parsedTrees.get(oid);
+    if (hit !== undefined) return hit;
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'tree') return undefined;
     const entries = parseTree(object.data);
-    repo.treeCache.set(oid, entries);
+    repo.parsedTrees.set(oid, entries);
     return entries;
   }
 
@@ -222,7 +222,7 @@ export class Store {
     const oid = hashObject(type, data);
     if (!repo.objects.has(oid)) {
       repo.objects.set(oid, { type, data });
-      this.touch(repo);
+      this.bump(repo);
     }
     return oid;
   }
@@ -231,7 +231,7 @@ export class Store {
     const oid = hashObject(object.type, object.data);
     if (!repo.objects.has(oid)) {
       repo.objects.set(oid, object);
-      this.touch(repo);
+      this.bump(repo);
     }
     return oid;
   }
@@ -271,12 +271,13 @@ export class Store {
     const seen = new Map<string, number>();
     const start = this.peelToCommit(repo, tip);
     if (start === undefined) return seen;
+    // Index-pointer queue: shift() on a long queue is O(n) per pop.
     const queue: Array<{ oid: string; depth: number }> = [{ oid: start, depth: 0 }];
     for (let head = 0; head < queue.length; head += 1) {
       const { oid, depth } = queue[head]!;
       if (seen.has(oid)) continue;
       seen.set(oid, depth);
-      const view = this.commitView(repo, oid);
+      const view = this.commitOf(repo, oid);
       if (view === undefined) continue;
       for (const parent of view.parents) {
         if (!seen.has(parent)) queue.push({ oid: parent, depth: depth + 1 });
@@ -286,28 +287,27 @@ export class Store {
   }
 
   /**
-   * Whether `ancestor` is `descendant` itself or one of its ancestors. A targeted walk
-   * from the descendant that stops the moment the ancestor is found — a push's
-   * fast-forward check is one hop (the new commit's parent is the old tip), where
-   * building the whole ancestor set was O(history) per push. Same answer as
-   * ancestors(descendant).has(ancestor): the ancestor is compared as the raw oid, so a
-   * tag oid never matches, and the descendant is peeled first, as ancestors() does.
+   * Whether `ancestor` is `descendant` itself or one of its ancestors. A push's
+   * fast-forward check is one hop (the new commit's parent is the old tip), so walk
+   * straight down from the descendant and stop the moment the ancestor is found
+   * instead of building the whole ancestor set, O(history) per push. Same answer as
+   * ancestors(descendant).has(ancestor): the ancestor is compared as the raw oid, so
+   * a tag oid never matches, and the descendant is peeled first, as ancestors() does.
    */
   isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
     const start = this.peelToCommit(repo, descendant);
-    if (start === undefined) return false;
-    if (start === ancestor) return true;
+    if (start === undefined || start === ancestor) return start === ancestor;
     const seen = new Set<string>([start]);
-    const queue: string[] = [start];
-    for (let head = 0; head < queue.length; head += 1) {
-      const view = this.commitView(repo, queue[head]!);
+    const stack: string[] = [start];
+    while (stack.length > 0) {
+      const view = this.commitOf(repo, stack.pop()!);
       if (view === undefined) continue;
       for (const parent of view.parents) {
         if (parent === ancestor) return true;
         if (!seen.has(parent)) {
           seen.add(parent);
-          queue.push(parent);
+          stack.push(parent);
         }
       }
     }
@@ -327,7 +327,7 @@ export class Store {
       if (seen.has(oid)) continue;
       seen.add(oid);
       if (aAncestors.has(oid)) return oid;
-      const view = this.commitView(repo, oid);
+      const view = this.commitOf(repo, oid);
       if (view === undefined) continue;
       for (const parent of view.parents) queue.push(parent);
     }
@@ -340,7 +340,7 @@ export class Store {
   treeFiles(repo: Repo, treeOid: string): Map<string, FileEntry> {
     const out = new Map<string, FileEntry>();
     const walk = (oid: string, prefix: string): void => {
-      const entries = this.treeEntries(repo, oid);
+      const entries = this.entriesOf(repo, oid);
       if (entries === undefined) return;
       for (const entry of entries) {
         const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
@@ -387,7 +387,7 @@ export class Store {
 
   /** The tree a commit names, or the empty tree when the commit is unknown. */
   treeOfCommit(repo: Repo, commitOid: string): string {
-    const view = this.commitView(repo, commitOid);
+    const view = this.commitOf(repo, commitOid);
     if (view === undefined) return this.putObject(repo, 'tree', buildTree([]));
     return view.tree;
   }
@@ -404,7 +404,7 @@ export class Store {
       buildCommit({ tree: treeOid, parents, message, author: FORGE_AUTHOR, committer: FORGE_AUTHOR }),
     );
     repo.refs.set(ref, commitOid);
-    this.touch(repo);
+    this.bump(repo);
     return commitOid;
   }
 
@@ -420,7 +420,7 @@ export class Store {
       const oid = stack.pop()!;
       if (seen.has(oid)) continue;
       seen.add(oid);
-      const view = this.commitView(repo, oid);
+      const view = this.commitOf(repo, oid);
       if (view === undefined) continue;
       const stamp = (line: string): number => {
         const match = / (\d+) [+-]\d{4}$/.exec(line);
@@ -505,15 +505,15 @@ export class Store {
       labels: [...labels],
       createdSeq: this.nextSeq(),
       comments: [],
-      cachedBody: null,
+      bodyBytes: null,
     };
     repo.issues.push(issue);
     return issue;
   }
 
   /** Drop an issue's cached serialized body: call after any mutation of its fields. */
-  invalidateIssue(issue: Issue): void {
-    issue.cachedBody = null;
+  dropIssueBody(issue: Issue): void {
+    issue.bodyBytes = null;
   }
 
   getIssue(repo: Repo, number: number): Issue | undefined {
@@ -536,7 +536,7 @@ export class Store {
     const id = ++repo.commentSeq;
     const comment: Comment = { id, gid: gid('IssueComment', `${repo.owner}/${repo.name}#${issue.number}:${id}`), body, createdSeq: this.nextSeq() };
     issue.comments.push(comment);
-    this.invalidateIssue(issue); // the comments count in the serialized body changed
+    this.dropIssueBody(issue); // the comment count in the serialized body changed
     return comment;
   }
 
@@ -662,7 +662,7 @@ export class Store {
       buildCommit({ tree: treeOid, parents: [baseTip], message, author: FORGE_AUTHOR, committer: FORGE_AUTHOR }),
     );
     repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
-    this.touch(repo);
+    this.bump(repo);
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedAt = FIXED_ISO;
@@ -716,15 +716,15 @@ export class Store {
   /**
    * The issue's serialized REST body, memoized on the issue. The bytes are exactly
    * JSON.stringify(issueJson(repo, issue)); every mutation path (REST PATCH, GraphQL
-   * closeIssue, addComment) invalidates via invalidateIssue, and label colors are fixed
-   * at creation, so the cached bytes can never be stale. Sending the cached Buffer also
-   * skips the per-request UTF-8 re-encode of res.end(string).
+   * closeIssue, addComment) drops the cache through dropIssueBody, and label colors are
+   * fixed at creation, so the cached bytes can never be stale. Sending the cached
+   * Buffer also skips the per-request UTF-8 re-encode of res.end(string).
    */
-  issueJsonBytes(repo: Repo, issue: Issue): Buffer {
-    const cached = issue.cachedBody;
-    if (cached !== null) return cached;
+  issueBodyBytes(repo: Repo, issue: Issue): Buffer {
+    const hit = issue.bodyBytes;
+    if (hit !== null) return hit;
     const body = Buffer.from(JSON.stringify(this.issueJson(repo, issue)), 'utf8');
-    issue.cachedBody = body;
+    issue.bodyBytes = body;
     return body;
   }
 

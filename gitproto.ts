@@ -17,26 +17,26 @@ import { Store, VIEWER_LOGIN, type Repo } from './store.ts';
 const MAX_PKT_LINE = 65520;
 /** The largest data chunk one sideband pkt-line may carry (band byte + data). */
 const SIDEBAND_CHUNK = 65000;
-/** The largest git-wire answer worth caching (a huge fetch's pack is rebuilt, not kept). */
-const GIT_CACHE_MAX_BYTES = 512 * 1024;
+/** The largest wire answer worth keeping (a huge fetch's pack is rebuilt, not cached). */
+const WIRE_CACHE_MAX_BYTES = 512 * 1024;
 /** The most cached answers a repo keeps; the map is cleared when it grows past this. */
-const GIT_CACHE_MAX_ENTRIES = 64;
+const WIRE_CACHE_MAX_ENTRIES = 64;
 
 /**
  * A cached git-wire answer for a repo, or undefined. The cache lives on the repo and
- * Store.touch() clears it on every object or ref write, so a cached answer can never
+ * Store.bump() clears it on every object or ref write, so a cached answer can never
  * outlive the state it was built from; the key only has to name the request. Fetch
  * answers are deterministic for (repo state, wants, haves, shallow, depth), so a
  * repeated identical fetch — fifty concurrent clones of one tip — is one pack build.
  */
-function cachedGitAnswer(repo: Repo, key: string): Buffer | undefined {
-  return repo.gitCache.get(key);
+function wireHit(repo: Repo, key: string): Buffer | undefined {
+  return repo.wireCache.get(key);
 }
 
-function cacheGitAnswer(repo: Repo, key: string, body: Buffer): Buffer {
-  if (body.length <= GIT_CACHE_MAX_BYTES) {
-    if (repo.gitCache.size >= GIT_CACHE_MAX_ENTRIES) repo.gitCache.clear();
-    repo.gitCache.set(key, body);
+function wireKeep(repo: Repo, key: string, body: Buffer): Buffer {
+  if (body.length <= WIRE_CACHE_MAX_BYTES) {
+    if (repo.wireCache.size >= WIRE_CACHE_MAX_ENTRIES) repo.wireCache.clear();
+    repo.wireCache.set(key, body);
   }
   return body;
 }
@@ -165,8 +165,8 @@ function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', store:
   return Buffer.concat(parts);
 }
 
-/** The v2 capability advertisement: `version 2` and one capability per line. Constant, built once. */
-const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+/** The v2 capability advertisement: `version 2` and one capability per line. Built once — it never changes. */
+const V2_ADS: Buffer = Buffer.concat([
   pktLine('version 2\n'),
   pktLine('agent=github-core-clone/0.1.0\n'),
   pktLine('ls-refs=unborn\n'),
@@ -191,7 +191,7 @@ function reachableObjects(store: Store, repo: Repo, tip: string): Map<string, Gi
     const commit = store.getObject(repo, oid);
     if (commit === undefined || commit.type !== 'commit' || out.has(oid)) return;
     out.set(oid, commit);
-    const view = store.commitView(repo, oid);
+    const view = store.commitOf(repo, oid);
     if (view === undefined) return;
     visitTree(view.tree);
     for (const parent of view.parents) visitCommit(parent);
@@ -200,7 +200,7 @@ function reachableObjects(store: Store, repo: Repo, tip: string): Map<string, Gi
     const tree = store.getObject(repo, oid);
     if (tree === undefined || tree.type !== 'tree' || out.has(oid)) return;
     out.set(oid, tree);
-    const entries = store.treeEntries(repo, oid);
+    const entries = store.entriesOf(repo, oid);
     if (entries === undefined) return;
     for (const entry of entries) {
       if (entry.mode === '40000') visitTree(entry.oid);
@@ -237,7 +237,7 @@ function commitOwnObjects(store: Store, repo: Repo, oid: string): Map<string, Gi
     const tree = store.getObject(repo, treeOid);
     if (tree === undefined || tree.type !== 'tree' || out.has(treeOid)) return;
     out.set(treeOid, tree);
-    const entries = store.treeEntries(repo, treeOid);
+    const entries = store.entriesOf(repo, treeOid);
     if (entries === undefined) return;
     for (const entry of entries) {
       if (entry.mode === '40000') visitTree(entry.oid);
@@ -247,7 +247,7 @@ function commitOwnObjects(store: Store, repo: Repo, oid: string): Map<string, Gi
       }
     }
   };
-  const view = store.commitView(repo, oid);
+  const view = store.commitOf(repo, oid);
   if (view !== undefined) visitTree(view.tree);
   return out;
 }
@@ -280,7 +280,7 @@ function planFetch(
     if (object.type === 'commit') {
       held.set(oid, object);
       if (shallowSet.has(oid)) continue; // a shallow tip: its parents are not held
-      const view = store.commitView(repo, oid);
+      const view = store.commitOf(repo, oid);
       if (view === undefined) continue;
       for (const parent of view.parents) heldQueue.push(parent);
       for (const [, entry] of store.treeFiles(repo, view.tree)) {
@@ -292,7 +292,7 @@ function planFetch(
         const tree = store.getObject(repo, treeOid);
         if (tree === undefined || tree.type !== 'tree' || held.has(treeOid)) return;
         held.set(treeOid, tree);
-        const entries = store.treeEntries(repo, treeOid);
+        const entries = store.entriesOf(repo, treeOid);
         if (entries === undefined) return;
         for (const entry of entries) {
           if (entry.mode === '40000') walkTree(entry.oid);
@@ -317,7 +317,7 @@ function planFetch(
     if (included.has(oid)) continue;
     if (depth !== null && d >= depth) continue;
     included.set(oid, d);
-    const view = store.commitView(repo, oid);
+    const view = store.commitOf(repo, oid);
     if (view === undefined) continue;
     for (const parent of view.parents) queue.push({ oid: parent, depth: d + 1 });
   }
@@ -325,7 +325,7 @@ function planFetch(
   // Boundary commits: included ones with a parent outside the included set.
   const shallow: string[] = [];
   for (const [oid] of included) {
-    const view = store.commitView(repo, oid);
+    const view = store.commitOf(repo, oid);
     if (view === undefined) continue;
     if (view.parents.some((parent) => !included.has(parent))) shallow.push(oid);
   }
@@ -333,7 +333,7 @@ function planFetch(
   const unshallow: string[] = [];
   for (const boundary of shallowBoundaries) {
     if (!included.has(boundary)) continue;
-    const view = store.commitView(repo, boundary);
+    const view = store.commitOf(repo, boundary);
     if (view === undefined) continue;
     if (view.parents.every((parent) => included.has(parent))) unshallow.push(boundary);
   }
@@ -396,8 +396,8 @@ function planFetch(
     }
     if (service === 'git-receive-pack') {
       const key = 'adv:git-receive-pack';
-      const cached = cachedGitAnswer(repo, key);
-      sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', cached ?? cacheGitAnswer(repo, key, v0Advertisement('git-receive-pack', store, repo)));
+      const cached = wireHit(repo, key);
+      sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', cached ?? wireKeep(repo, key, v0Advertisement('git-receive-pack', store, repo)));
       return;
     }
     if (service !== 'git-upload-pack') {
@@ -406,12 +406,12 @@ function planFetch(
     }
     const wantsV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
     if (wantsV2) {
-      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
+      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADS);
       return;
     }
     const key = 'adv:git-upload-pack';
-    const cached = cachedGitAnswer(repo, key);
-    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', cached ?? cacheGitAnswer(repo, key, v0Advertisement('git-upload-pack', store, repo)));
+    const cached = wireHit(repo, key);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', cached ?? wireKeep(repo, key, v0Advertisement('git-upload-pack', store, repo)));
   }
 
   /** The v2 ls-refs answer: HEAD, the refs, peeled tags, honouring ref-prefix. */
@@ -513,15 +513,15 @@ function planFetch(
       const args = lines.filter((line) => !line.startsWith('command=') && !line.startsWith('agent=') && !line.startsWith('object-format='));
       if (command === 'ls-refs') {
         const key = `ls-refs:${JSON.stringify(args)}`;
-        const cached = cachedGitAnswer(repo, key);
-        sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached ?? cacheGitAnswer(repo, key, handleLsRefs(store, repo, args)));
+        const cached = wireHit(repo, key);
+        sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached ?? wireKeep(repo, key, handleLsRefs(store, repo, args)));
         return;
       }
       if (command === 'fetch') {
         const request = parseFetchArgs(args);
         const key = `fetch:v2:${JSON.stringify(request)}`;
-        const cached = cachedGitAnswer(repo, key);
-        sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached ?? cacheGitAnswer(repo, key, handleFetchV2(store, repo, request)));
+        const cached = wireHit(repo, key);
+        sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached ?? wireKeep(repo, key, handleFetchV2(store, repo, request)));
         return;
       }
       sendText(res, 400, `unknown v2 command ${JSON.stringify(command)}\n`);
@@ -535,8 +535,8 @@ function planFetch(
     }
     const request = parseFetchArgs([...(sections[0] ?? []), ...(sections[1] ?? [])]);
     const key = `fetch:v0:${JSON.stringify(request)}`;
-    const cached = cachedGitAnswer(repo, key);
-    sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached ?? cacheGitAnswer(repo, key, handleFetchV0(store, repo, request)));
+    const cached = wireHit(repo, key);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached ?? wireKeep(repo, key, handleFetchV0(store, repo, request)));
   }
 
   /** The want/have/shallow/deepen arguments of a fetch request, v2 or v0. */
@@ -647,7 +647,7 @@ function planFetch(
         else if (command.oldOid !== ZERO_OID && command.oldOid !== current) reason = 'non-fast-forward';
         else {
           repo.refs.delete(command.ref);
-          store.touch(repo);
+          store.bump(repo);
           ok = true;
         }
       } else if (command.oldOid === ZERO_OID) {
@@ -656,7 +656,7 @@ function planFetch(
         else if (store.getObject(repo, command.newOid) === undefined) reason = 'object not found';
         else {
           repo.refs.set(command.ref, command.newOid);
-          store.touch(repo);
+          store.bump(repo);
           ok = true;
         }
       } else {
@@ -667,7 +667,7 @@ function planFetch(
         else if (!isFastForward(store, repo, current, command.newOid)) reason = 'non-fast-forward';
         else {
           repo.refs.set(command.ref, command.newOid);
-          store.touch(repo);
+          store.bump(repo);
           ok = true;
         }
       }
